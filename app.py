@@ -3,9 +3,10 @@ import streamlit as st
 import pandas as pd
 import requests
 import yfinance as yf
-from pandas_datareader import data as pdr  # ← Stooq 폴백용
+from pandas_datareader import data as pdr  # Stooq fallback
 from datetime import datetime
 import pytz
+import time
 
 # ---------------------------
 # 기본 설정
@@ -14,6 +15,20 @@ KST = pytz.timezone("Asia/Seoul")
 st.set_page_config(page_title="투자 비교 대시보드 (O·예적금·BTC/ETH)", layout="wide")
 st.title("📊 투자 비교 대시보드: 리얼티인컴 · 예·적금 · BTC/ETH (Finlife API 버전)")
 st.caption("KRW 기준 비교. 환율/수수료 적용·미적용을 분리해 계산합니다. 예·적금 데이터는 금융감독원 Finlife 공식 API를 사용합니다.")
+
+# ---------------------------
+# 유틸: 간단 재시도
+# ---------------------------
+def _retry(times, delay, func, *args, **kwargs):
+    last_err = None
+    for _ in range(times):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            time.sleep(delay)
+    if last_err:
+        raise last_err
 
 # ---------------------------
 # 환율 (Frankfurter, 실패 시 기본값)
@@ -32,17 +47,67 @@ def get_usdkrw():
         return 1350.0, datetime.now().strftime("%Y-%m-%d")
 
 # ---------------------------
+# yfinance 배당 보강: 2경로 + 재시도
+# ---------------------------
+@st.cache_data(ttl=900)
+def _get_last_monthly_dividend_yf_robust(ticker: str):
+    """
+    yfinance 배당 시도:
+      1) Ticker.dividends
+      2) yf.download(..., actions=True)["Dividends"] 최근 양수값
+    성공 시 (value, "source"), 실패 시 (None, "reason1 | reason2")
+    """
+    # path1: Ticker.dividends
+    try:
+        def _path1():
+            t = yf.Ticker(ticker)
+            s = t.dividends
+            if s is not None and len(s) > 0:
+                v = float(s.iloc[-1])
+                if v > 0:
+                    return v
+            raise ValueError("empty dividends via Ticker.dividends")
+        v1 = _retry(2, 0.8, _path1)
+        return v1, "from Ticker.dividends"
+    except Exception as e1:
+        reason1 = f"dividends path1 fail: {e1}"
+
+    # path2: download(actions=True)
+    try:
+        def _path2():
+            df = yf.download(
+                ticker,
+                period="2y",
+                interval="1d",
+                auto_adjust=False,
+                actions=True,
+                progress=False,
+                threads=False,
+            )
+            if isinstance(df, pd.DataFrame) and "Dividends" in df.columns:
+                nonzero = df["Dividends"][df["Dividends"] > 0]
+                if not nonzero.empty:
+                    return float(nonzero.iloc[-1])
+            raise ValueError("empty dividends via download(actions=True)")
+        v2 = _retry(2, 0.8, _path2)
+        return v2, "from download(actions=True)"
+    except Exception as e2:
+        reason2 = f"dividends path2 fail: {e2}"
+
+    return None, f"{reason1} | {reason2}"
+
+# ---------------------------
 # 리얼티인컴 가격/배당 (yfinance → Stooq 폴백)
 # ---------------------------
 @st.cache_data(ttl=900)
 def get_realty_income_price_div(ticker="O"):
     """
-    1차: yfinance 가격/배당 시도
-    2차: 가격은 Stooq(o.us)로 폴백, 배당은 None (사이드바 수동 입력 사용)
+    가격: yfinance → 실패 시 Stooq(o.us)
+    배당: yfinance 2경로 보강
     """
-    price_usd, price_date, last_monthly_div = None, None, None
+    price_usd, price_date = None, None
 
-    # 1) yfinance 우선 시도
+    # 가격: yfinance
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="3mo", interval="1d", auto_adjust=False)
@@ -52,28 +117,23 @@ def get_realty_income_price_div(ticker="O"):
                 price_date = hist.index[-1].tz_localize("UTC").astimezone(KST).strftime("%Y-%m-%d")
             except Exception:
                 price_date = str(hist.index[-1].date())
-        # 배당(월배당)
-        try:
-            divs = t.dividends
-            if divs is not None and len(divs) > 0:
-                last_monthly_div = float(divs.iloc[-1])
-        except Exception:
-            pass
     except Exception:
         pass
 
-    # 2) 가격 폴백: Stooq ('O' -> 'o.us')
+    # 가격: Stooq 폴백
     if price_usd is None:
         try:
-            stooq = pdr.DataReader("o.us", "stooq")
-            stooq = stooq.sort_index()
+            stooq = pdr.DataReader("o.us", "stooq").sort_index()
             if not stooq.empty:
                 price_usd = float(stooq["Close"].iloc[-1])
                 price_date = str(stooq.index[-1].date())
         except Exception:
             pass
 
-    return price_usd, price_date, last_monthly_div
+    # 배당: 보강 함수
+    last_monthly_div, div_source = _get_last_monthly_dividend_yf_robust(ticker)
+
+    return price_usd, price_date, last_monthly_div, div_source
 
 # ---------------------------
 # 업비트 일봉
@@ -175,7 +235,7 @@ def finlife_top5_deposit(api_key: str):
     정기예금:
     - topFinGrpNo=020000(은행)
     - 옵션: 단리(S), 12개월
-    - 정렬: 기본금리(%) (intr_rate) 내림차순
+    - 정렬: 기본금리(%) 내림차순
     """
     try:
         js = finlife_fetch(api_key, "depositProductsSearch.json", 1)
@@ -193,7 +253,7 @@ def finlife_top5_deposit(api_key: str):
         return pd.DataFrame()
 
 # ---------------------------
-# (NEW) 적금 Top5 혼합 선정 함수
+# 적금 Top5 혼합 선정: 기본Top1 + 우대Top1 + 종합Top3(중복 제외)
 # ---------------------------
 @st.cache_data(ttl=600)
 def finlife_saving_top5_mixed(api_key: str, principal_krw: float):
@@ -273,7 +333,7 @@ def finlife_saving_top5_mixed(api_key: str, principal_krw: float):
         # 선정기준 & 기준금리
         def basis_and_rate(row):
             if row["상품코드"] in pick_base["상품코드"].values:
-                return "기본금리 Top1", row["기본문리(%)"] if "기본문리(%)" in row else row["기본금리(%)"]
+                return "기본금리 Top1", row["기본금리(%)"]
             if row["상품코드"] in pick_pref["상품코드"].values:
                 return "최고우대 Top1", row["최고우대(%)"]
             return "종합 Top", row["종합(평균)(%)"]
@@ -332,7 +392,7 @@ with st.sidebar:
     upbit_fee_reserved = st.number_input("업비트 KRW 마켓 수수료 (예약, %)", min_value=0.0, max_value=1.0, value=0.139, step=0.001)
     mirae_us_fee = st.number_input("미래에셋 미국주식 온라인 수수료 (%)", min_value=0.0, max_value=1.0, value=0.25, step=0.01)
 
-    # ← 여기 추가된 섹션 (월배당 수동 입력)
+    # 리얼티인컴 배당(수동 입력)
     st.markdown("---")
     st.subheader("리얼티인컴 배당(수동 입력 옵션)")
     monthly_div_override = st.number_input(
@@ -355,7 +415,7 @@ with st.sidebar:
 # ---------------------------
 st.header("1) 리얼티인컴 (O): 종가·배당·수수료")
 
-price_usd, price_date, last_monthly_div = get_realty_income_price_div("O")
+price_usd, price_date, last_monthly_div, div_source = get_realty_income_price_div("O")
 c1, c2, c3 = st.columns([1.1,1.6,1.1])
 
 with c1:
@@ -367,8 +427,9 @@ with c1:
         st.error("가격 데이터를 불러오지 못했습니다. (yfinance/Stooq)")
 
 with c2:
-    # yfinance에서 배당 실패 시 수동 입력 사용
-    monthly_div_usd = last_monthly_div if (last_monthly_div and last_monthly_div > 0) else (monthly_div_override if monthly_div_override > 0 else 0.0)
+    # 배당: 자동(robust) → 없으면 수동 입력
+    monthly_div_usd_auto = last_monthly_div if (last_monthly_div is not None and last_monthly_div > 0) else None
+    monthly_div_usd = monthly_div_usd_auto if monthly_div_usd_auto is not None else (monthly_div_override if monthly_div_override > 0 else 0.0)
     annual_div_usd = monthly_div_usd * 12
 
     if price_usd:
@@ -394,17 +455,21 @@ with c2:
         st.write(f"- 수수료 미적용: **{shares_no_fee:.4f}주**")
         st.write(f"- 수수료 적용(매수 {mirae_us_fee:.2f}%): **{shares_fee:.4f}주**")
 
-        st.write("**배당 (USD → KRW 환산)**")
-        st.write(f"- 월배당(미적용): **${m_div_usd_no_fee:,.2f} → {m_div_krw_no_fee:,.0f}원**")
-        st.write(f"- 연배당(미적용): **${y_div_usd_no_fee:,.2f} → {y_div_krw_no_fee:,.0f}원**")
-        st.write(f"- 월배당(수수료 적용): **${m_div_usd_fee:,.2f} → {m_div_krw_fee:,.0f}원**")
-        st.write(f"- 연배당(수수료 적용): **${y_div_usd_fee:,.2f} → {y_div_krw_fee:,.0f}원**")
-
-        if monthly_div_usd > 0 and price_usd:
+        if monthly_div_usd > 0:
+            st.write("**배당 (USD → KRW 환산)**")
+            st.write(f"- 월배당(미적용): **${m_div_usd_no_fee:,.2f} → {m_div_krw_no_fee:,.0f}원**")
+            st.write(f"- 연배당(미적용): **${y_div_usd_no_fee:,.2f} → {y_div_krw_no_fee:,.0f}원**")
+            st.write(f"- 월배당(수수료 적용): **${m_div_usd_fee:,.2f} → {m_div_krw_fee:,.0f}원**")
+            st.write(f"- 연배당(수수료 적용): **${y_div_usd_fee:,.2f} → {y_div_krw_fee:,.0f}원**")
             curr_yield = (annual_div_usd / price_usd) * 100
             st.metric("배당수익률(연, %)", f"{curr_yield:.2f}%")
         else:
             st.info("배당 데이터가 없어 수익률 표시를 생략합니다. (사이드바에서 월배당 입력 가능)")
+            if monthly_div_usd_auto is None and monthly_div_override == 0:
+                with st.expander("ℹ️ 배당 데이터가 비는 이유 보기", expanded=False):
+                    st.write("yfinance에서 배당을 가져오지 못했습니다.")
+                    st.code(str(div_source or "no reason"), language="text")
+                    st.write("사이드바의 ‘월배당 (USD/주)’ 값을 입력하면 바로 계산됩니다.")
     else:
         st.info("가격 정보가 없어서 배당 환산을 생략했습니다.")
 
@@ -500,9 +565,11 @@ with s1:
     if price_usd:
         show_price = price_usd * (usdkrw if apply_fx else 1.0)
         st.write(f"- 종가: **{'$'+format(price_usd, ',.2f') if not apply_fx else format(show_price, ',.0f')+'원'}**")
-        # 위에서 계산한 monthly_div_usd 그대로 사용
-        annual_div_usd = monthly_div_usd * 12
-        if monthly_div_usd > 0:
+        if 'monthly_div_usd' in locals():
+            annual_div_usd = monthly_div_usd * 12
+        else:
+            annual_div_usd = 0.0
+        if 'monthly_div_usd' in locals() and monthly_div_usd > 0:
             buy_fee = (mirae_us_fee/100.0) if apply_fees else 0.0
             usd_budget = (base_amt_krw / (usdkrw if apply_fx else 1.0))
             shares_fee = usd_budget * (1 - buy_fee) / price_usd
