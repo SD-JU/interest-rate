@@ -90,12 +90,6 @@ def finlife_fetch(api_key: str, endpoint: str, page_no: int = 1):
     r.raise_for_status()
     return r.json()
 
-def _to_numeric(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
-
 def _filter_options(df_opt: pd.DataFrame, *, save_trm: int = 12, intr_rate_type: str = "S", rsrv_type: str | None = None):
     """
     save_trm: 만기(개월), e.g., 12
@@ -115,8 +109,7 @@ def _filter_options(df_opt: pd.DataFrame, *, save_trm: int = 12, intr_rate_type:
         out = out[out["rsrv_type"] == rsrv_type]
     return out
 
-def _merge_base_option(base: pd.DataFrame, opt: pd.DataFrame, *,
-                       sort_by: str, top_n: int = 5, label_map: dict | None = None):
+def _merge_base_option(base: pd.DataFrame, opt: pd.DataFrame, *, sort_by: str, top_n: int = 5):
     """
     base: baseList (상품 기본정보)
     opt:  optionList (금리 옵션: intr_rate(기본), intr_rate2(우대))
@@ -125,9 +118,9 @@ def _merge_base_option(base: pd.DataFrame, opt: pd.DataFrame, *,
     if base is None or base.empty or opt is None or opt.empty:
         return pd.DataFrame()
 
-    # 옵션 테이블에서 같은 상품(fin_prdt_cd) 내 중복 → 최대값(해당 금리)으로 집계
+    # 같은 상품(fin_prdt_cd) 내 최대값 집계
     best = (
-        opt.groupby("fin_prdt_cd")[[col for col in ["intr_rate", "intr_rate2"] if col in opt.columns]]
+        opt.groupby("fin_prdt_cd")[[c for c in ["intr_rate", "intr_rate2"] if c in opt.columns]]
            .max()
            .reset_index()
     )
@@ -137,10 +130,9 @@ def _merge_base_option(base: pd.DataFrame, opt: pd.DataFrame, *,
     if sort_by in merged.columns:
         merged = merged.sort_values(sort_by, ascending=False)
     else:
-        # 기본금리/우대금리 둘 다 없다면 바로 빈 DF
         return pd.DataFrame()
 
-    # 표 컬럼 구성
+    # 표 컬럼
     out = pd.DataFrame()
     out["은행"] = merged.get("kor_co_nm", "")
     out["상품명"] = merged.get("fin_prdt_nm", "")
@@ -148,11 +140,6 @@ def _merge_base_option(base: pd.DataFrame, opt: pd.DataFrame, *,
         out["기본금리(%)"] = merged["intr_rate"].round(3)
     if "intr_rate2" in merged.columns:
         out["최고우대(%)"] = merged["intr_rate2"].round(3)
-
-    # 레이블 치환(선택)
-    if label_map:
-        out["은행"] = out["은행"].replace(label_map)
-
     return out.head(top_n).reset_index(drop=True)
 
 @st.cache_data(ttl=600)
@@ -160,8 +147,8 @@ def finlife_top5_deposit(api_key: str):
     """
     정기예금:
     - topFinGrpNo=020000(은행)
-    - 옵션 필터: 단리(S), 12개월
-    - 정렬: '기본금리(%)' (intr_rate) 내림차순
+    - 옵션: 단리(S), 12개월
+    - 정렬: 기본금리(%) (intr_rate) 내림차순
     """
     try:
         js = finlife_fetch(api_key, "depositProductsSearch.json", 1)
@@ -178,32 +165,117 @@ def finlife_top5_deposit(api_key: str):
         st.error(f"Finlife 예금 API 오류: {e}")
         return pd.DataFrame()
 
+# ---------------------------
+# (NEW) 적금 Top5 혼합 선정 함수
+# ---------------------------
 @st.cache_data(ttl=600)
-def finlife_top5_saving(api_key: str):
+def finlife_saving_top5_mixed(api_key: str, principal_krw: float):
     """
-    적금:
-    - topFinGrpNo=020000(은행)
-    - 옵션 필터: 자유적립식(F), 단리(S), 12개월
-    - 정렬: '최고우대(%)' (intr_rate2) 내림차순 (동률 시 기본금리 보조)
+    적금 Top5 구성:
+      1) 기본금리(%) Top 1
+      2) 최고우대(%) Top 1
+      3) 종합 Top 3  (종합금리 = (기본금리 + 최고우대) / 2; 둘 중 하나만 있으면 그 값)
+    앞선 선정과 '중복 없이' 총 5개로 구성.
+    각 행의 '기준금리(%)'로 연이자(원, 단리) 계산하여 표시.
     """
     try:
+        if not api_key:
+            return pd.DataFrame()
+
         js = finlife_fetch(api_key, "savingProductsSearch.json", 1)
         base = pd.DataFrame(js.get("result", {}).get("baseList", []))
         opt  = pd.DataFrame(js.get("result", {}).get("optionList", []))
         if base.empty or opt.empty:
             return pd.DataFrame()
+
+        # 옵션 필터: 자유적립식(F), 단리(S), 12개월
         opt_f = _filter_options(opt, save_trm=12, intr_rate_type="S", rsrv_type="F")
         if opt_f.empty:
             return pd.DataFrame()
-        # 우선 정렬 키 생성
-        opt_f = opt_f.copy()
-        opt_f["intr_rate2"] = pd.to_numeric(opt_f["intr_rate2"], errors="coerce")
+
+        # 숫자화
         opt_f["intr_rate"]  = pd.to_numeric(opt_f["intr_rate"], errors="coerce")
-        opt_f = opt_f.sort_values(["intr_rate2","intr_rate"], ascending=False)
-        out = _merge_base_option(base, opt_f, sort_by="intr_rate2", top_n=5)
-        return out
+        opt_f["intr_rate2"] = pd.to_numeric(opt_f["intr_rate2"], errors="coerce")
+
+        # 상품별 최대값
+        best = (
+            opt_f.groupby("fin_prdt_cd")[["intr_rate", "intr_rate2"]]
+                .max()
+                .reset_index()
+        )
+        merged = base.merge(best, on="fin_prdt_cd", how="inner")
+        if merged.empty:
+            return pd.DataFrame()
+
+        # 컬럼 정리
+        merged["base_rate"] = pd.to_numeric(merged["intr_rate"], errors="coerce")
+        merged["pref_rate"] = pd.to_numeric(merged["intr_rate2"], errors="coerce")
+
+        # 둘 다 NaN이면 제외
+        merged = merged[~(merged["base_rate"].isna() & merged["pref_rate"].isna())].copy()
+
+        # 종합(평균) 금리
+        merged["combined_rate"] = merged[["base_rate", "pref_rate"]].mean(axis=1, skipna=True)
+
+        # 뷰용 DF
+        df = pd.DataFrame({
+            "은행": merged["kor_co_nm"],
+            "상품명": merged["fin_prdt_nm"],
+            "기본금리(%)": merged["base_rate"].round(3),
+            "최고우대(%)": merged["pref_rate"].round(3),
+            "종합(평균)(%)": merged["combined_rate"].round(3),
+            "상품코드": merged["fin_prdt_cd"],
+        })
+
+        # 기본 Top1
+        base_ranked = df.dropna(subset=["기본금리(%)"]).sort_values("기본금리(%)", ascending=False)
+        pick_base = base_ranked.head(1).copy()
+
+        # 우대 Top1 (중복 제외)
+        pref_ranked = df.dropna(subset=["최고우대(%)"]).sort_values("최고우대(%)", ascending=False)
+        pref_ranked = pref_ranked[~pref_ranked["상품코드"].isin(pick_base["상품코드"])]
+        pick_pref = pref_ranked.head(1).copy()
+
+        # 종합 Top3 (중복 제외)
+        combined_ranked = df.dropna(subset=["종합(평균)(%)"]).sort_values("종합(평균)(%)", ascending=False)
+        combined_ranked = combined_ranked[~combined_ranked["상품코드"].isin(pd.concat([pick_base["상품코드"], pick_pref["상품코드"]]))]
+        pick_combined = combined_ranked.head(3).copy()
+
+        out = pd.concat([pick_base, pick_pref, pick_combined], ignore_index=True)
+
+        # 선정기준 & 기준금리
+        def basis_and_rate(row):
+            if row["상품코드"] in pick_base["상품코드"].values:
+                return "기본금리 Top1", row["기본금리(%)"]
+            if row["상품코드"] in pick_pref["상품코드"].values:
+                return "최고우대 Top1", row["최고우대(%)"]
+            return "종합 Top", row["종합(평균)(%)"]
+
+        basis_list, basis_rate = [], []
+        for _, r in out.iterrows():
+            b, rate = basis_and_rate(r)
+            basis_list.append(b)
+            basis_rate.append(rate)
+
+        out["선정기준"] = basis_list
+        out["기준금리(%)"] = basis_rate
+
+        # 연이자(원, 단리) = 기준금리 사용
+        out["연이자(원, 단리)"] = (
+            principal_krw * (pd.to_numeric(out["기준금리(%)"], errors="coerce") / 100.0)
+        ).round(0).astype("Int64")
+
+        # 보기 좋은 정렬
+        rank_order = {"기본금리 Top1": 0, "최고우대 Top1": 1, "종합 Top": 2}
+        out["_ord"] = out["선정기준"].map(rank_order).fillna(3)
+        out = out.sort_values(["_ord", "기준금리(%)"], ascending=[True, False]).drop(columns=["_ord"])
+
+        # 최종 컬럼 순서
+        out = out[["은행", "상품명", "선정기준", "기준금리(%)", "기본금리(%)", "최고우대(%)", "종합(평균)(%)", "연이자(원, 단리)"]]
+        return out.reset_index(drop=True)
+
     except Exception as e:
-        st.error(f"Finlife 적금 API 오류: {e}")
+        st.error(f"Finlife 적금 혼합 랭킹 생성 중 오류: {e}")
         return pd.DataFrame()
 
 def add_simple_interest_krw(df: pd.DataFrame, principal_krw: float, rate_col: str):
@@ -235,7 +307,13 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Finlife 오픈 API 키")
-    finlife_key = st.secrets.get("FINLIFE_API_KEY") or st.sidebar.text_input("API Key", type="password")
+    # secrets.toml이 없거나 키가 없으면 예외가 나므로 안전하게 처리
+try:
+    finlife_key = st.secrets["FINLIFE_API_KEY"]
+except Exception:
+    finlife_key = None
+
+finlife_key = finlife_key or st.sidebar.text_input("API Key", type="password")
 
 # ---------------------------
 # 1) 리얼티인컴 (O): 종가·배당·수수료 + KRW 환산
@@ -313,12 +391,11 @@ if not finlife_key:
     st.warning("Finlife API Key가 없습니다. 사이드바에 키를 입력하면 실시간 예·적금 금리가 표시됩니다.")
 
 deposit_df = finlife_top5_deposit(finlife_key) if finlife_key else pd.DataFrame()
-saving_df  = finlife_top5_saving(finlife_key)  if finlife_key else pd.DataFrame()
+# 적금: 기본 Top1 + 우대 Top1 + 종합 Top3 (중복 제외) + 각 항목 기준금리로 연이자 계산
+saving_show  = finlife_saving_top5_mixed(finlife_key, base_amt_krw) if finlife_key else pd.DataFrame()
 
-# 연이자(원) 계산 칼럼 추가
+# 예금은 기존처럼 기본금리 기준 Top5 + 연이자(단리)
 deposit_show = add_simple_interest_krw(deposit_df, base_amt_krw, "기본금리(%)") if not deposit_df.empty else deposit_df
-# 적금은 최고우대(%) 기준 수익 비교가 일반적이므로 그 기준으로 연이자 산출
-saving_show  = add_simple_interest_krw(saving_df,  base_amt_krw, "최고우대(%)")  if not saving_df.empty else saving_df
 
 colA, colB = st.columns(2)
 with colA:
@@ -328,7 +405,7 @@ with colA:
     st.dataframe(deposit_show, use_container_width=True, hide_index=True)
 
 with colB:
-    st.subheader("적금 Top 5 (자유적립식·단리·12개월 / 정렬: 최고우대)")
+    st.subheader("적금 Top 5 (기본 Top1 · 우대 Top1 · 종합 Top3, 연이자 포함)")
     if saving_show.empty:
         st.info("적금 데이터가 비어 있습니다. (API 키, 네트워크, 혹은 조건에 맞는 옵션 미존재 가능성)")
     st.dataframe(saving_show, use_container_width=True, hide_index=True)
@@ -409,7 +486,7 @@ with s2:
     st.dataframe(deposit_show if not deposit_show.empty else pd.DataFrame(), use_container_width=True, hide_index=True)
 
 with s3:
-    st.subheader("적금 Top 5 (연이자 KRW 포함)")
+    st.subheader("적금 Top 5 (기본 Top1 · 우대 Top1 · 종합 Top3, 연이자 포함)")
     st.dataframe(saving_show if not saving_show.empty else pd.DataFrame(), use_container_width=True, hide_index=True)
 
 st.markdown("---")
@@ -417,9 +494,9 @@ st.markdown(
 """
 **메모**  
 - 예금: 제1금융권(topFinGrpNo=020000) / **단리(S)** / **12개월** 옵션만 필터하고, **기본금리(%)** 기준으로 정렬합니다.  
-- 적금: 제1금융권 / **자유적립식(F)** / **단리(S)** / **12개월** 옵션만 필터하고, **최고우대(%)** 기준으로 정렬합니다.  
-- 연이자(원)는 기준 금액 × (금리/100) **단리**로 계산했습니다(세전). 실제 우대조건/기간에 따라 달라질 수 있습니다.  
+- 적금: 제1금융권 / **자유적립식(F)** / **단리(S)** / **12개월** 옵션에서  
+  **기본금리 Top1 + 최고우대 Top1 + 종합(평균) Top3**(중복 제외)로 구성하고,  
+  각 항목의 **기준금리(%)**로 `연이자(원, 단리)`를 계산해 표시합니다.  
 - 리얼티인컴 배당의 KRW 환산은 보유주식 수(수수료 반영) × 월배당(USD/주) × 환율로 계산합니다.  
 """
 )
-
