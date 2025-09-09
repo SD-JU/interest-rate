@@ -235,7 +235,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Finlife 오픈 API 키")
-    finlife_key = st.text_input("API Key", type="password", help="금융감독원 ‘금융상품 한눈에’ 오픈API 인증키를 입력하세요.")
+    finlife_key = st.secrets.get("FINLIFE_API_KEY") or st.sidebar.text_input("API Key", type="password")
 
 # ---------------------------
 # 1) 리얼티인컴 (O): 종가·배당·수수료 + KRW 환산
@@ -422,3 +422,4 @@ st.markdown(
 - 리얼티인컴 배당의 KRW 환산은 보유주식 수(수수료 반영) × 월배당(USD/주) × 환율로 계산합니다.  
 """
 )
+
