@@ -1,0 +1,18 @@
+# --- core app ---
+streamlit==1.37.1
+
+# --- data stack ---
+pandas==2.2.2
+numpy==1.26.4
+
+# --- HTTP & timezones ---
+requests==2.32.3
+pytz==2024.1
+
+# --- market data (Yahoo Finance) ---
+yfinance==0.2.43
+
+# --- yfinance deps (안전용; 보통 자동으로 같이 설치되지만 명시해 두면 안정적) ---
+lxml==5.3.0
+frozendict==2.4.4
+multitasking==0.0.11
